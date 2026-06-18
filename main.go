@@ -163,7 +163,9 @@ func runBench(label string, poolSizes []int, n, recommended int, fn func(*sql.DB
 	for _, size := range poolSizes {
 		db := mustOpen()
 		dur, avg := fn(db, size, n)
+		db.SetMaxIdleConns(0)
 		db.Close()
+		time.Sleep(time.Second)
 		tps := float64(n) / dur.Seconds()
 		results = append(results, result{size, dur, tps, avg})
 		if tps > peakTps {
