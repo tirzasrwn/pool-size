@@ -19,14 +19,25 @@ connections = (core_count × 2) + effective_spindle_count
 
 ## How the Demo Works
 
-1. **Setup** — creates a `bench` table with 50,000 rows (PK, random integer, text padding)
-2. **Warmup** — runs sequential scans to load data into PostgreSQL's buffer cache
-3. **Benchmark** — for each pool size (2–90), fires 2000 concurrent goroutines doing PK lookups against PostgreSQL:
+1. **Setup** — creates a `bench` table with 50,000 rows (PK, random integer, 100-char text padding)
+2. **Warmup** — runs sequential scans in parallel to load data into PostgreSQL's buffer cache
+3. **Benchmark** — for each pool size (2–90), fires concurrent goroutines performing database operations:
    - `SetMaxOpenConns` caps the number of concurrent database connections
    - Excess goroutines queue up inside Go's `database/sql` pool (simulating real-world pool saturation)
    - Measures wall-clock duration and average per-query latency (including queue wait time)
 
-Each benchmark creates a fresh connection pool so results are independent.
+Each pool size gets a fresh `sql.DB` so results are independent. Goroutines are managed with `errgroup.Group` which handles `Add`/`Done`/error propagation automatically.
+
+### Four CRUD Benchmarks
+
+| Benchmark | Query | What it tests |
+|-----------|-------|---------------|
+| SELECT PK lookup | `SELECT val, padding FROM bench WHERE id = $1` | CPU-bound index scan |
+| INSERT single row | `INSERT INTO bench (val, padding) VALUES ($1, $2)` | Write path + WAL flush |
+| UPDATE PK lookup | `UPDATE bench SET padding = $1 WHERE id = $2` | Write path + row locking |
+| DELETE PK lookup | `DELETE FROM bench WHERE id = $1` | Write path + MVCC cleanup |
+
+Operations are ordered from least to most destructive: SELECT → INSERT → UPDATE → DELETE.
 
 ## Requirements
 
@@ -40,7 +51,7 @@ Each benchmark creates a fresh connection pool so results are independent.
 # Set up the database
 createdb pool-size
 
-# Run the demo
+# Run the demo (creates table, warms cache, runs all benchmarks)
 go run .
 ```
 
@@ -52,43 +63,65 @@ const dsn = "host=localhost port=5432 user=postgres password=postgres dbname=poo
 
 ## Interpreting the Results
 
-On an **8-core** machine, the benchmark produces a curve like this:
+On an **8-core** machine, the four benchmarks show distinct curves:
 
 ```
-Pool Size  Duration       Throughput/s   Avg Latency
-    2       111ms          18,041         57ms
-    4        74ms          26,988         43ms
-    8        68ms          29,368         39ms     ← peak throughput
-   12        75ms          26,650         45ms
-   16        71ms          27,988         45ms
-   20        82ms          24,417         55ms
-   24        93ms          21,552         64ms
-   32        97ms          20,711         68ms
-   40       112ms          17,875         66ms
-   60       140ms          14,335        100ms
-   80       171ms          11,679        126ms
-   90       202ms           9,893        127ms
+SELECT PK lookup — 2000 queries       INSERT single row — 2000 queries
+
+Pool Size  Throughput/s   Avg Latency  Pool Size  Throughput/s   Avg Latency
+    2        17,993          57ms           2         1,142         892ms
+    4        28,164          40ms           4         2,348         430ms
+    8        26,693          46ms           8         4,435         231ms
+   12        29,612          41ms  <- peak  12         6,520         161ms
+   16        29,430          43ms          16         8,188         133ms
+   20        25,287          54ms          20         9,095         122ms
+   24        24,953          56ms          24         8,861         136ms
+   32        22,716          61ms          32         9,082         145ms
+   40        20,024          75ms          40        12,324         107ms
+   50        13,802          96ms          50        13,708         102ms  <- peak
+   60        14,268          88ms          60        12,185         113ms
+   70        12,767         110ms          70        11,420         127ms
+   80        11,151         127ms          80         9,261         170ms
+   90         9,193         160ms          90        10,507         134ms
+
+UPDATE PK lookup — 2000 queries         DELETE PK lookup — 2000 queries
+
+Pool Size  Throughput/s   Avg Latency   Pool Size  Throughput/s   Avg Latency
+    2         1,160         865ms            2         1,164         879ms
+    4         2,268         435ms            4         2,483         411ms
+    8         4,498         228ms            8         5,156         200ms
+   12         6,402         165ms           12         7,749         136ms
+   16         7,781         141ms           16         9,288         116ms
+   20         8,758         126ms           20        11,874          95ms
+   24         8,368         138ms           24        12,638          94ms
+   28        10,364         120ms           28        14,833          86ms
+   32        11,503         100ms           32        15,062          90ms  <- peak
+   40        11,666         115ms  <- peak   40        14,625          94ms
+   50        10,820         116ms           50        12,591         115ms
+   60         7,983         177ms           60        13,055         107ms
+   70         7,638         194ms           70         9,486         159ms
+   80         8,329         183ms           80         9,209         174ms
+   90         7,696         198ms           90        10,459         140ms
 ```
 
-| Zone | Pool Size | Behavior |
-|------|-----------|----------|
-| Too few | 2 | DB is underutilized; throughput is low |
-| Sweet spot | 4–16 | Peak throughput, lowest latency |
-| Too many | 32+ | Throughput degrades, latency climbs |
+| Operation | Peak Pool | Throughput | Why |
+|-----------|-----------|------------|-----|
+| SELECT    | 12–16     | ~29,600/s  | CPU-bound, fast index scan → fewer connections optimal |
+| INSERT    | ~50       | ~13,700/s  | WAL flush, disk I/O → more connections hide latency |
+| UPDATE    | ~40       | ~11,700/s  | WAL + row locks → similar to INSERT |
+| DELETE    | ~32       | ~15,100/s  | MVCC mark-dead (no data moved) → faster than INSERT |
 
-The recommended formula value `(8 × 2 + 1) = 17` lands at the upper end of the sweet spot.
+### Why do writes need more connections?
 
-### Why does performance degrade with more connections?
+Reads (SELECT) are CPU-bound — PostgreSQL scans the index in memory and returns the row. With fast queries, context switching from too many connections dominates.
 
-PostgreSQL spawns one backend process per connection. When the number of active connections exceeds the number of CPU cores, the operating system must context-switch between these processes. This overhead reduces the time available for actual database work, causing throughput to drop and latency to rise.
+Writes (INSERT/UPDATE/DELETE) hit the **WAL (Write-Ahead Log)** and eventually the disk. During WAL flush, the backend process is **blocked on I/O**, allowing other connections to use the CPU. This I/O wait means more connections can be productive, pushing the optimal pool size higher.
 
-## Tuning the Demo
+The formula `(cores × 2) + spindles` accounts for this: the `spindles` term represents I/O wait. An all-flash database with a fully cached dataset behaves more like the SELECT case (fewer connections). A spinning-disk database behaves more like the INSERT case (more connections).
 
-You can adjust:
+### Why does performance degrade with too many connections?
 
-- **Query count** — change the `n` argument in `benchmark(size, n)` calls
-- **Table size** — change the `generate_series(1, 50000)` range in `setup()`
-- **Query type** — the slow query variant is in `benchmarkSlow()` (commented out)
+PostgreSQL spawns one backend process per connection. When active connections exceed CPU cores, the OS context-switches between them. This overhead reduces time for actual database work, dropping throughput and raising latency.
 
 ## Pool-Locking Formula
 
@@ -100,12 +133,24 @@ pool_size = Tn × (Cm - 1) + 1
 
 Where `Tn` = max threads, `Cm` = max connections per thread.
 
+## Code Structure
+
+| File | Purpose |
+|------|---------|
+| `main.go` | Setup, warmup, benchmark runner, all 4 CRUD benchmark functions |
+| `go.mod` | Dependencies: `pgx/v5` (PostgreSQL driver), `x/sync/errgroup` (goroutine management) |
+
+Key functions:
+- `runBench()` — iterates pool sizes, runs a benchmark function, prints the table with peak marker
+- `benchmarkSelect/Insert/Update/Delete()` — each creates goroutines via `errgroup.Group.Go()` and measures throughput + latency
+- `randSeq()` — generates random strings for INSERT/UPDATE payloads
+
 ## Caveats
 
 - Pool sizing is deployment-specific. The formula is a starting point, not a rule.
-- Mix of long and short transactions may benefit from separate pool instances.
-- The demo uses fast PK lookups. Slower queries shift the bottleneck to the DB CPU, where the sweet spot tends to be even smaller.
-- Your mileage will vary based on hardware, dataset size, query complexity, and PostgreSQL configuration.
+- The demo uses fast PK operations. Sequential scans or complex joins shift the bottleneck differently.
+- Writes show higher variance because WAL flushes and checkpointing add non-deterministic latency.
+- Your mileage will vary based on CPU cores, disk type (SSD vs HDD), dataset size, and PostgreSQL configuration (especially `max_connections`, `shared_buffers`, and `wal_buffers`).
 
 ## References
 
